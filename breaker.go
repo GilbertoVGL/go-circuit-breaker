@@ -7,55 +7,40 @@ import (
 	"time"
 )
 
-type state string
+type State string
 
 const (
-	Closed   state = "closed"
-	HalfOpen state = "half-open"
-	Open     state = "open"
+	Closed   State = "closed"
+	HalfOpen State = "half-open"
+	Open     State = "open"
 
-	_windowRoll  = 15
-	_windowFrame = 300
+	_windowRoll      = 15
+	_windowFrame     = 300
+	_halfOpenTimeout = 30
 )
 
 var (
-	errOpenCircuit = errors.New("circuit open")
+	ErrOpenCircuit     = errors.New("circuit open")
+	ErrHalfOpenCircuit = errors.New("circuit half open")
 )
 
 type (
-	circuitCall func() error
-	canTrip     func(c Counts) bool
-	stateSwitch func(old, new state)
+	circuitCall         func() error
+	canTrip             func(summary Counts) bool
+	fromHalfOpenToState func(summary Counts) State
 )
 
-type circuitState struct {
-	s  state
-	mu sync.RWMutex
-}
-
-type deadline struct {
-	t  time.Time
-	mu sync.Mutex
-}
-
 type CircuitBreaker struct {
-	canTrip canTrip
-	open    atomic.Bool
-	state   circuitState
+	state             state
+	onHalfOpenTimeout *atomic.Bool
 
-	toHalfOpen         time.Duration
-	toHalfOpenDeadline deadline
-	halfOpenAllowed    uint64
+	canTrip             canTrip
+	fromHalfOpenToState fromHalfOpenToState
 
-	countsTTL      time.Duration
-	countsDeadline deadline
-	summary        Counts
+	cfg configuration
 
-	windowRoll    time.Duration
-	windowFrame   time.Duration
-	rollingWindow []Counts
-
-	mu sync.Mutex
+	rollingWindow *rollingWindow
+	summary       summary
 }
 
 type Counts struct {
@@ -64,21 +49,85 @@ type Counts struct {
 	Success uint64
 }
 
-func New() CircuitBreaker {
+type rollingWindow struct {
+	window []Counts
+
+	mu sync.Mutex
+}
+
+type summary struct {
+	counts Counts
+
+	mu sync.Mutex
+}
+
+type state struct {
+	s State
+
+	mu sync.Mutex
+}
+
+type configuration struct {
+	windowRoll      time.Duration
+	windowFrame     time.Duration
+	halfOpenTimeout time.Duration
+}
+
+func New() (cb *CircuitBreaker, cancel func()) {
 	frames := _windowFrame / _windowRoll
-	return CircuitBreaker{
-		windowRoll:    (time.Second * _windowRoll),
-		windowFrame:   (time.Second * _windowFrame),
-		rollingWindow: make([]Counts, frames),
+
+	defaultCfg := configuration{
+		windowRoll:      (time.Second * _windowRoll),
+		windowFrame:     (time.Second * _windowFrame),
+		halfOpenTimeout: (time.Second * _halfOpenTimeout),
+	}
+
+	cb = &CircuitBreaker{
+		cfg: defaultCfg,
+		rollingWindow: &rollingWindow{
+			window: make([]Counts, 1, frames),
+		},
+	}
+
+	controller := &stateControler{cfg: cb.cfg}
+	cb.fromHalfOpenToState = controller.defaultFromHalfOpenToState
+	cb.canTrip = controller.defaultCanTrip
+
+	cancelCh := make(chan struct{})
+	cancel = cancelFunc(cancelCh)
+	go cb.renewFrame(cancelCh)
+	go cb.renewWindow(cancelCh)
+
+	return cb, cancel
+}
+
+func (c *CircuitBreaker) renewFrame(cancel <-chan struct{}) {
+	for {
+		select {
+		case <-time.After(c.cfg.windowFrame):
+			c.addFrame()
+		case <-cancel:
+			return
+		}
+	}
+}
+
+func (c *CircuitBreaker) renewWindow(cancel <-chan struct{}) {
+	for {
+		select {
+		case <-time.After(c.cfg.windowRoll):
+			c.unshiftWindow()
+		case <-cancel:
+			return
+		}
 	}
 }
 
 func (c *CircuitBreaker) Execute(fn circuitCall) error {
-	c.toNewGeneration()
+	defer c.afterExecute()
 
-	state := c.updateBasedOnState()
-	if state == Open {
-		return errOpenCircuit
+	if err := c.canExecute(); err != nil {
+		return err
 	}
 
 	defer func() {
@@ -88,86 +137,160 @@ func (c *CircuitBreaker) Execute(fn circuitCall) error {
 		}
 	}()
 
-	err := fn()
-	if err != nil {
+	if err := fn(); err != nil {
 		c.incrFail()
-	} else {
-		c.incrSuccess()
+		return err
 	}
 
-	return err
+	c.incrSuccess()
+	return nil
 }
 
-func (c *CircuitBreaker) updateBasedOnState() state {
-	c.state.mu.RLock()
-	defer c.state.mu.RUnlock()
-
+func (c *CircuitBreaker) afterExecute() {
 	switch c.state.s {
 	case Closed:
-		if c.canTrip(c.summary) {
-			c.switchState(Open)
-		}
-
-	case HalfOpen:
-		if c.halfOpenAllowed > c.summary.Success {
-
+		if c.canTrip(c.summary.counts) {
+			c.state.s = Open
 		}
 
 	case Open:
-		c.toHalfOpenDeadline.mu.Lock()
-		defer c.toHalfOpenDeadline.mu.Unlock()
+		if c.onHalfOpenTimeout.Load() {
+			return
+		}
+		go c.waitHalfOpen()
 
-		now := time.Now().UTC()
-		if now.After(c.toHalfOpenDeadline.t) {
-			c.switchState(HalfOpen)
-			c.resetCounts()
+	case HalfOpen:
+		lastFrame := c.rollingWindow.window[(len(c.rollingWindow.window) - 1)]
+
+		switch c.fromHalfOpenToState(lastFrame) {
+		case Open:
+			if c.onHalfOpenTimeout.Load() {
+				return
+			}
+			go c.waitHalfOpen()
+
+			c.setState(Open)
+			c.popWindow()
+
+		case Closed:
+			c.setState(Closed)
+			c.popWindow()
 		}
 	}
-
-	return c.state.s
 }
 
-func (c *CircuitBreaker) toNewGeneration() {
-	c.countsDeadline.mu.Lock()
-	defer c.countsDeadline.mu.Unlock()
-
-	now := time.Now().UTC()
-	if now.After(c.countsDeadline.t) {
-		c.countsDeadline.t = now.Add(c.countsTTL)
-		c.resetCounts()
-	}
+func (c *CircuitBreaker) waitHalfOpen() {
+	c.onHalfOpenTimeout.Store(true)
+	<-time.After(c.cfg.halfOpenTimeout)
+	c.setState(HalfOpen)
+	c.onHalfOpenTimeout.Store(false)
 }
 
-func (c *CircuitBreaker) switchState(new state) {
+func (c *CircuitBreaker) setState(s State) {
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
 
-	c.state.s = new
+	c.state.s = s
 }
 
-func (c *CircuitBreaker) resetCounts() {
-	atomic.StoreUint64(&c.summary.Total, 0)
-	atomic.StoreUint64(&c.summary.Success, 0)
-	atomic.StoreUint64(&c.summary.Fail, 0)
+func (c *CircuitBreaker) canExecute() error {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+
+	if c.state.s == Open {
+		return ErrOpenCircuit
+	}
+
+	if c.state.s == HalfOpen {
+		return ErrHalfOpenCircuit
+	}
+
+	return nil
+}
+
+func (c *CircuitBreaker) addFrame() {
+	c.rollingWindow.mu.Lock()
+	defer c.rollingWindow.mu.Unlock()
+
+	c.rollingWindow.window = append(c.rollingWindow.window, Counts{})
+}
+
+func (c *CircuitBreaker) unshiftWindow() {
+	removedFrame := c.unshiftFrame()
+	c.decrSummary(removedFrame.Fail, removedFrame.Success)
+}
+
+func (c *CircuitBreaker) popWindow() {
+	removedFrame := c.popFrame()
+	c.decrSummary(removedFrame.Fail, removedFrame.Success)
+}
+
+// unshiftFrame Removes the first frame from the rolling window.
+func (c *CircuitBreaker) unshiftFrame() Counts {
+	c.rollingWindow.mu.Lock()
+	defer c.rollingWindow.mu.Unlock()
+
+	removedFrame := c.rollingWindow.window[0]
+
+	renewedWindow := make([]Counts, (len(c.rollingWindow.window) - 1))
+	copy(renewedWindow, c.rollingWindow.window[1:])
+	c.rollingWindow.window = renewedWindow
+
+	return removedFrame
+}
+
+// popFrame Removes the last frame from the rolling window.
+func (c *CircuitBreaker) popFrame() Counts {
+	c.rollingWindow.mu.Lock()
+	defer c.rollingWindow.mu.Unlock()
+
+	i := (len(c.rollingWindow.window) - 1)
+
+	removedFrame := c.rollingWindow.window[i]
+
+	renewedWindow := make([]Counts, i)
+	copy(renewedWindow, c.rollingWindow.window[:i])
+	c.rollingWindow.window = renewedWindow
+
+	return removedFrame
 }
 
 func (c *CircuitBreaker) incrSuccess() {
-	atomic.AddUint64(&c.summary.Total, 1)
-	atomic.AddUint64(&c.summary.Success, 1)
+	c.rollingWindow.mu.Lock()
+	defer c.rollingWindow.mu.Unlock()
+
+	go c.incrSummary(0, 1)
+
+	i := (len(c.rollingWindow.window) - 1)
+	c.rollingWindow.window[i].Total += 1
+	c.rollingWindow.window[i].Success += 1
 }
 
 func (c *CircuitBreaker) incrFail() {
-	atomic.AddUint64(&c.summary.Total, 1)
-	atomic.AddUint64(&c.summary.Fail, 1)
+	c.rollingWindow.mu.Lock()
+	defer c.rollingWindow.mu.Unlock()
+
+	go c.incrSummary(1, 0)
+
+	i := (len(c.rollingWindow.window) - 1)
+	c.rollingWindow.window[i].Total += 1
+	c.rollingWindow.window[i].Fail += 1
 }
 
-func (c *CircuitBreaker) moveWindow() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	frame := c.rollingWindow[0]
-	c.summary.Fail -= frame.Fail
-	c.summary.Success -= frame.Success
-	c.summary.Total -= frame.Total
-	c.rollingWindow = c.rollingWindow[1:]
-	c.rollingWindow = append(c.rollingWindow, Counts{})
+func (c *CircuitBreaker) incrSummary(fail, success uint64) {
+	c.summary.mu.Lock()
+	defer c.summary.mu.Unlock()
+
+	c.summary.counts.Fail += fail
+	c.summary.counts.Success += success
+	c.summary.counts.Total += (fail + success)
+}
+
+func (c *CircuitBreaker) decrSummary(fail, success uint64) {
+	c.summary.mu.Lock()
+	defer c.summary.mu.Unlock()
+
+	c.summary.counts.Fail -= fail
+	c.summary.counts.Success -= success
+	c.summary.counts.Total -= (fail + success)
 }

@@ -25,9 +25,11 @@ func fixtureCircuitCall() error {
 }
 
 func Test_Breaker(t *testing.T) {
-	br := New()
-	br.summary.Total = 99
-	br.summary.Fail = 9
+	br, cancel := New()
+	defer cancel()
+
+	br.summary.counts.Total = 99
+	br.summary.counts.Fail = 9
 
 	br.canTrip = fixtureCanTrip
 
