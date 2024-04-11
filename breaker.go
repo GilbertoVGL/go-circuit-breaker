@@ -73,25 +73,36 @@ type configuration struct {
 	halfOpenTimeout time.Duration
 }
 
-func New() (cb *CircuitBreaker, cancel func()) {
-	frames := _windowFrame / _windowRoll
+func New(opts ...options) (cb *CircuitBreaker, cancel func()) {
+	controller := &stateControler{halfOpenTimeout: time.Second * _halfOpenTimeout}
+	cbOpts := &optionsConfiguration{
+		windowFrame:       _windowFrame,
+		windowRoll:        _windowRoll,
+		halfOpenThreshold: _halfOpenTimeout,
 
-	defaultCfg := configuration{
-		windowRoll:      (time.Second * _windowRoll),
-		windowFrame:     (time.Second * _windowFrame),
-		halfOpenTimeout: (time.Second * _halfOpenTimeout),
+		canTrip:             controller.defaultCanTrip,
+		fromHalfOpenToState: controller.defaultFromHalfOpenToState,
 	}
 
+	for _, opt := range opts {
+		opt(cbOpts)
+	}
+
+	frames := cbOpts.windowFrame / cbOpts.windowRoll
 	cb = &CircuitBreaker{
-		cfg: defaultCfg,
+		cfg: configuration{
+			windowRoll:      (time.Second * time.Duration(cbOpts.windowRoll)),
+			windowFrame:     (time.Second * time.Duration(cbOpts.windowFrame)),
+			halfOpenTimeout: (time.Second * time.Duration(cbOpts.halfOpenThreshold)),
+		},
+
+		canTrip:             cbOpts.canTrip,
+		fromHalfOpenToState: cbOpts.fromHalfOpenToState,
+
 		rollingWindow: &rollingWindow{
 			window: make([]Counts, 1, frames),
 		},
 	}
-
-	controller := &stateControler{cfg: cb.cfg}
-	cb.fromHalfOpenToState = controller.defaultFromHalfOpenToState
-	cb.canTrip = controller.defaultCanTrip
 
 	cancelCh := make(chan struct{})
 	cancel = cancelFunc(cancelCh)
@@ -105,6 +116,9 @@ func (c *CircuitBreaker) renewFrame(cancel <-chan struct{}) {
 	for {
 		select {
 		case <-time.After(c.cfg.windowFrame):
+			if c.state.s == HalfOpen {
+				return
+			}
 			c.addFrame()
 		case <-cancel:
 			return
@@ -116,6 +130,9 @@ func (c *CircuitBreaker) renewWindow(cancel <-chan struct{}) {
 	for {
 		select {
 		case <-time.After(c.cfg.windowRoll):
+			if c.state.s == HalfOpen {
+				return
+			}
 			c.unshiftWindow()
 		case <-cancel:
 			return

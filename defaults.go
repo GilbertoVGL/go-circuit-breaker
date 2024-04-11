@@ -6,9 +6,9 @@ import (
 )
 
 type stateControler struct {
-	cfg       configuration
-	active    bool
-	threshold int64
+	halfOpenTimeout time.Duration
+	active          bool
+	threshold       int64
 
 	mu sync.Mutex
 }
@@ -25,7 +25,7 @@ func (sc *stateControler) defaultFromHalfOpenToState(summary Counts) State {
 
 	if !sc.active {
 		sc.active = true
-		sc.threshold = now + (int64(sc.cfg.halfOpenTimeout.Seconds()) / 2)
+		sc.threshold = now + (int64(sc.halfOpenTimeout.Seconds()) / 2)
 
 		return HalfOpen
 	}
