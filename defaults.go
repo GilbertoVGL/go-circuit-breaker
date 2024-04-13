@@ -14,7 +14,7 @@ type stateControler struct {
 }
 
 func (sc *stateControler) defaultCanTrip(summary Counts) bool {
-	return summary.Fail/summary.Total >= 60
+	return summary.Total > 10 && ((float64(summary.Fail)/float64(summary.Total))*100) >= 60
 }
 
 func (sc *stateControler) defaultFromHalfOpenToState(summary Counts) State {
