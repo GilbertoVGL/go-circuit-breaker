@@ -2,6 +2,7 @@ package breaker
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,14 +15,15 @@ const (
 	HalfOpen State = "half-open"
 	Open     State = "open"
 
-	_windowRoll      = 15
-	_windowFrame     = 300
+	_windowRoll      = 300
+	_windowFrame     = 15
 	_halfOpenTimeout = 30
 )
 
 var (
-	ErrOpenCircuit     = errors.New("circuit open")
-	ErrHalfOpenCircuit = errors.New("circuit half open")
+	ErrNewCircuitBreaker = errors.New("failed to create circuit breaker")
+	ErrOpenCircuit       = errors.New("circuit open")
+	ErrHalfOpenCircuit   = errors.New("circuit half open")
 )
 
 type (
@@ -31,8 +33,8 @@ type (
 )
 
 type CircuitBreaker struct {
-	state             state
-	onHalfOpenTimeout *atomic.Bool
+	state             *state
+	onHalfOpenTimeout atomic.Bool
 
 	canTrip             canTrip
 	fromHalfOpenToState fromHalfOpenToState
@@ -40,7 +42,7 @@ type CircuitBreaker struct {
 	cfg configuration
 
 	rollingWindow *rollingWindow
-	summary       summary
+	summary       *summary
 }
 
 type Counts struct {
@@ -73,7 +75,7 @@ type configuration struct {
 	halfOpenTimeout time.Duration
 }
 
-func New(opts ...options) (cb *CircuitBreaker, cancel func()) {
+func New(opts ...option) (cb *CircuitBreaker, cancel func(), err error) {
 	controller := &stateControler{halfOpenTimeout: time.Second * _halfOpenTimeout}
 	cbOpts := &optionsConfiguration{
 		windowFrame:       _windowFrame,
@@ -85,22 +87,33 @@ func New(opts ...options) (cb *CircuitBreaker, cancel func()) {
 	}
 
 	for _, opt := range opts {
-		opt(cbOpts)
+		if err = opt(cbOpts); err != nil {
+			return cb, cancel, fmt.Errorf("%w: %s", ErrNewCircuitBreaker, err)
+		}
 	}
 
-	frames := cbOpts.windowFrame / cbOpts.windowRoll
+	if cbOpts.windowFrame > cbOpts.windowRoll {
+		return cb, cancel, fmt.Errorf("%w: frame threshold can't be minor than window roll", ErrNewCircuitBreaker)
+	}
+
+	frames := cbOpts.windowRoll / cbOpts.windowFrame
 	cb = &CircuitBreaker{
 		cfg: configuration{
 			windowRoll:      (time.Second * time.Duration(cbOpts.windowRoll)),
 			windowFrame:     (time.Second * time.Duration(cbOpts.windowFrame)),
 			halfOpenTimeout: (time.Second * time.Duration(cbOpts.halfOpenThreshold)),
 		},
-
 		canTrip:             cbOpts.canTrip,
 		fromHalfOpenToState: cbOpts.fromHalfOpenToState,
 
+		state: &state{
+			s: Closed,
+		},
 		rollingWindow: &rollingWindow{
 			window: make([]Counts, 1, frames),
+		},
+		summary: &summary{
+			counts: Counts{},
 		},
 	}
 
@@ -109,7 +122,7 @@ func New(opts ...options) (cb *CircuitBreaker, cancel func()) {
 	go cb.renewFrame(cancelCh)
 	go cb.renewWindow(cancelCh)
 
-	return cb, cancel
+	return cb, cancel, nil
 }
 
 func (c *CircuitBreaker) renewFrame(cancel <-chan struct{}) {
@@ -276,7 +289,7 @@ func (c *CircuitBreaker) incrSuccess() {
 	c.rollingWindow.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
 
-	go c.incrSummary(0, 1)
+	c.incrSummary(0, 1)
 
 	i := (len(c.rollingWindow.window) - 1)
 	c.rollingWindow.window[i].Total += 1
@@ -287,7 +300,7 @@ func (c *CircuitBreaker) incrFail() {
 	c.rollingWindow.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
 
-	go c.incrSummary(1, 0)
+	c.incrSummary(1, 0)
 
 	i := (len(c.rollingWindow.window) - 1)
 	c.rollingWindow.window[i].Total += 1

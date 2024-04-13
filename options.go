@@ -1,6 +1,8 @@
 package breaker
 
-type options func(opt *optionsConfiguration)
+import "errors"
+
+type option func(opt *optionsConfiguration) error
 
 type optionsConfiguration struct {
 	windowFrame       int
@@ -11,32 +13,52 @@ type optionsConfiguration struct {
 	canTrip             canTrip
 }
 
-func WithWindowFrameThreshold(frameSeconds int) options {
-	return func(opt *optionsConfiguration) {
-		opt.windowFrame = frameSeconds
+func WithWindowFrameThreshold(seconds int) option {
+	return func(opt *optionsConfiguration) error {
+		if seconds <= 0 {
+			return errors.New("frame can't be less than equal zero")
+		}
+		opt.windowFrame = seconds
+		return nil
 	}
 }
 
-func WithWindowRollThreshold(rollSeconds int) options {
-	return func(opt *optionsConfiguration) {
-		opt.windowRoll = rollSeconds
+func WithWindowRollThreshold(seconds int) option {
+	return func(opt *optionsConfiguration) error {
+		if seconds <= 0 {
+			return errors.New("window roll can't be less than equal zero")
+		}
+		opt.windowRoll = seconds
+		return nil
 	}
 }
 
-func WithHalOpenThreshold(halfOpenThreshold int) options {
-	return func(opt *optionsConfiguration) {
-		opt.halfOpenThreshold = halfOpenThreshold
+func WithHalfOpenThreshold(seconds int) option {
+	return func(opt *optionsConfiguration) error {
+		if seconds <= 0 {
+			return errors.New("half open threshold can't be less than equal zero")
+		}
+		opt.halfOpenThreshold = seconds
+		return nil
 	}
 }
 
-func WithCanTrip(canTrip canTrip) options {
-	return func(opt *optionsConfiguration) {
+func WithCanTrip(canTrip canTrip) option {
+	return func(opt *optionsConfiguration) error {
+		if canTrip == nil {
+			return errors.New("can trip callback can't be <nil>")
+		}
 		opt.canTrip = canTrip
+		return nil
 	}
 }
 
-func WithFromHalfOpenToState(fromHalfOpenToState fromHalfOpenToState) options {
-	return func(opt *optionsConfiguration) {
+func WithFromHalfOpenToState(fromHalfOpenToState fromHalfOpenToState) option {
+	return func(opt *optionsConfiguration) error {
+		if fromHalfOpenToState == nil {
+			return errors.New("half open state change callback can't be <nil>")
+		}
 		opt.fromHalfOpenToState = fromHalfOpenToState
+		return nil
 	}
 }
