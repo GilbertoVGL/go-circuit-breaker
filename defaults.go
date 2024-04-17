@@ -1,42 +1,15 @@
 package breaker
 
-import (
-	"sync"
-	"time"
-)
-
-type stateControler struct {
-	halfOpenTimeout time.Duration
-	active          bool
-	threshold       int64
-
-	mu sync.Mutex
-}
-
-func (sc *stateControler) defaultCanTrip(summary Counts) bool {
+func defaultCanTrip(summary Counts) bool {
 	return summary.Total > 10 && ((float64(summary.Fail)/float64(summary.Total))*100) >= 60
 }
 
-func (sc *stateControler) defaultFromHalfOpenToState(summary Counts) State {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	now := time.Now().UTC().Unix()
-
-	if !sc.active {
-		sc.active = true
-		sc.threshold = now + (int64(sc.halfOpenTimeout.Seconds()) / 2)
-
-		return HalfOpen
-	}
-
+func defaultFromHalfOpenToState(summary Counts) State {
 	if summary.Fail > 0 {
-		sc.active = false
 		return Open
 	}
 
-	if summary.Fail == 0 && now > sc.threshold {
-		sc.active = false
+	if summary.Total > 100 && (summary.Fail/summary.Total*100) < 99 {
 		return Closed
 	}
 

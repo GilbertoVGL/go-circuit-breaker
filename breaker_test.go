@@ -2,6 +2,8 @@ package breaker
 
 import (
 	"errors"
+	"math/rand"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,13 +11,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var errCall = errors.New("execute error")
+
 func fixtureCircuitCall(err error) func() error {
 	return func() error {
 		return err
 	}
 }
 
-func TestCircuitBreakerCreationSuccess(t *testing.T) {
+func TestBreakerCreationSuccess(t *testing.T) {
 	type expected struct {
 		onHalfOpenTimeout bool
 		windowLen         int
@@ -136,7 +140,7 @@ func TestCircuitBreakerCreationSuccess(t *testing.T) {
 	}
 }
 
-func TestCircuitBreakerCreationFails(t *testing.T) {
+func TestBreakerCreationFails(t *testing.T) {
 	tt := []struct {
 		name     string
 		input    []option
@@ -219,7 +223,7 @@ func TestCircuitBreakerCreationFails(t *testing.T) {
 	}
 }
 
-func Test_BreakerOpen(t *testing.T) {
+func TestBreakerOpen(t *testing.T) {
 	cb, cancel, err := New(
 		WithWindowFrameThreshold(1000),
 		WithWindowRollThreshold(100000),
@@ -228,21 +232,188 @@ func Test_BreakerOpen(t *testing.T) {
 	require.NoError(t, err)
 	defer cancel()
 
-	callErr := errors.New("execute error")
 	calls := []error{
-		callErr, callErr, callErr, callErr, callErr, callErr, callErr,
+		errCall, errCall, errCall, errCall, errCall, errCall, errCall,
+		nil, nil, nil, nil, nil,
+	}
+
+	expectedCounts := Counts{
+		Total:   11,
+		Fail:    7,
+		Success: 4,
+	}
+	expectedWindow := make([]Counts, 1, (100000 / 1000))
+	expectedWindow[0] = expectedCounts
+
+	feedCircuitBreakerHelper(cb, calls, false)
+
+	assert.Equal(t, cb.state.s, Open)
+	assert.Equal(t, expectedCounts, cb.summary.counts)
+	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
+	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
+	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+}
+
+func TestBreakerClosedToHalfOpen(t *testing.T) {
+	calls := []error{
+		errCall, errCall, errCall, errCall, errCall, errCall, errCall,
 		nil, nil, nil, nil,
 	}
 
-	for _, err := range calls {
-		_ = cb.Execute(fixtureCircuitCall(err))
+	expectedCounts := Counts{
+		Total:   11,
+		Fail:    7,
+		Success: 4,
 	}
+	expectedWindow := make([]Counts, 2, 3)
+	expectedWindow[0] = expectedCounts
 
-	frame := cb.rollingWindow.window[0]
+	cb, cancel, err := New(
+		WithWindowFrameThreshold(10),
+		WithWindowRollThreshold(30),
+		WithHalfOpenThreshold(2),
+	)
+	require.NoError(t, err)
+	defer cancel()
+
+	feedCircuitBreakerHelper(cb, calls, false)
+
+	time.Sleep(cb.cfg.halfOpenTimeout)
+
+	assert.Equal(t, HalfOpen, cb.state.s)
+	assert.Equal(t, expectedCounts, cb.summary.counts)
+	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
+	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
+	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
 
 	err = cb.Execute(fixtureCircuitCall(nil))
-	assert.ErrorIs(t, err, ErrOpenCircuit)
-	assert.Equal(t, uint64(7), frame.Fail)
-	assert.Equal(t, uint64(4), frame.Success)
-	assert.Equal(t, uint64(11), frame.Total)
+	assert.NoError(t, err)
+}
+
+func TestBreakerHalfOpenToOpen(t *testing.T) {
+	calls := []error{
+		errCall, errCall, errCall, errCall, errCall, errCall, errCall,
+		nil, nil, nil, nil,
+	}
+
+	expectedCounts := Counts{
+		Total:   11,
+		Fail:    7,
+		Success: 4,
+	}
+	expectedWindow := make([]Counts, 1, 3)
+	expectedWindow[0] = expectedCounts
+
+	cb, cancel, err := New(
+		WithWindowFrameThreshold(10),
+		WithWindowRollThreshold(30),
+		WithHalfOpenThreshold(2),
+	)
+	require.NoError(t, err)
+	defer cancel()
+
+	feedCircuitBreakerHelper(cb, calls, false)
+
+	time.Sleep(cb.cfg.halfOpenTimeout)
+
+	err = cb.Execute(fixtureCircuitCall(errCall))
+
+	assert.Equal(t, Open, cb.state.s)
+	assert.Equal(t, expectedCounts, cb.summary.counts)
+	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
+	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
+	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+	assert.ErrorIs(t, err, errCall)
+}
+
+func TestBreakerHalfOpenToClosed(t *testing.T) {
+	closedCalls := []error{
+		errCall, errCall, errCall, errCall, errCall, errCall, errCall,
+		nil, nil, nil, nil,
+	}
+	halfOpenCalls := make([]error, 101)
+
+	expectedCounts := Counts{
+		Total:   11,
+		Fail:    7,
+		Success: 4,
+	}
+	expectedWindow := make([]Counts, 1, 3)
+	expectedWindow[0] = expectedCounts
+
+	cb, cancel, err := New(
+		WithWindowFrameThreshold(10),
+		WithWindowRollThreshold(30),
+		WithHalfOpenThreshold(2),
+	)
+	require.NoError(t, err)
+	defer cancel()
+
+	feedCircuitBreakerHelper(cb, closedCalls, false)
+
+	time.Sleep(cb.cfg.halfOpenTimeout)
+
+	feedCircuitBreakerHelper(cb, halfOpenCalls, false)
+
+	assert.Equal(t, Closed, cb.state.s)
+	assert.Equal(t, expectedCounts, cb.summary.counts)
+	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
+	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
+	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+	assert.ErrorIs(t, err, nil)
+}
+
+func TestBreakerWindowRoll(t *testing.T) {
+	closedCalls := []error{
+		nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		errCall, errCall,
+	}
+	frame := Counts{
+		Total:   15,
+		Fail:    2,
+		Success: 13,
+	}
+	expectedCounts := Counts{
+		Total:   (frame.Total * 2),
+		Fail:    (frame.Fail * 2),
+		Success: (frame.Success * 2),
+	}
+	expectedWindow := make([]Counts, 3)
+	expectedWindow[0] = frame
+	expectedWindow[1] = frame
+	expectedWindow[2] = Counts{}
+
+	cb, cancel, err := New(
+		WithWindowFrameThreshold(10),
+		WithWindowRollThreshold(30),
+		WithHalfOpenThreshold(2),
+	)
+	require.NoError(t, err)
+	defer cancel()
+
+	for i := 0; i < 3; i++ {
+		feedCircuitBreakerHelper(cb, closedCalls, false)
+		time.Sleep(cb.cfg.windowFrame)
+	}
+
+	assert.Equal(t, Closed, cb.state.s)
+	assert.Equal(t, expectedCounts, cb.summary.counts)
+	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
+	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
+	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+}
+
+func feedCircuitBreakerHelper(cb *CircuitBreaker, calls []error, withJitter bool) {
+	var wg sync.WaitGroup
+	wg.Add(len(calls))
+	for _, err := range calls {
+		if withJitter {
+			time.Sleep(time.Duration(rand.Int63n(int64(2))))
+		}
+		go func(execErr error) {
+			defer wg.Done()
+			_ = cb.Execute(fixtureCircuitCall(execErr))
+		}(err)
+	}
+	wg.Wait()
 }

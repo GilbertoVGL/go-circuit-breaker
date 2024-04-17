@@ -23,7 +23,6 @@ const (
 var (
 	ErrNewCircuitBreaker = errors.New("failed to create circuit breaker")
 	ErrOpenCircuit       = errors.New("circuit open")
-	ErrHalfOpenCircuit   = errors.New("circuit half open")
 )
 
 type (
@@ -76,14 +75,13 @@ type configuration struct {
 }
 
 func New(opts ...option) (cb *CircuitBreaker, cancel func(), err error) {
-	controller := &stateControler{halfOpenTimeout: time.Second * _halfOpenTimeout}
 	cbOpts := &optionsConfiguration{
 		windowFrame:       _windowFrame,
 		windowRoll:        _windowRoll,
 		halfOpenThreshold: _halfOpenTimeout,
 
-		canTrip:             controller.defaultCanTrip,
-		fromHalfOpenToState: controller.defaultFromHalfOpenToState,
+		canTrip:             defaultCanTrip,
+		fromHalfOpenToState: defaultFromHalfOpenToState,
 	}
 
 	for _, opt := range opts {
@@ -181,13 +179,8 @@ func (c *CircuitBreaker) afterExecute() {
 	case Closed:
 		if c.canTrip(c.summary.counts) {
 			c.state.s = Open
+			go c.waitHalfOpen()
 		}
-
-	case Open:
-		if c.onHalfOpenTimeout.Load() {
-			return
-		}
-		go c.waitHalfOpen()
 
 	case HalfOpen:
 		lastFrame := c.rollingWindow.window[(len(c.rollingWindow.window) - 1)]
@@ -213,6 +206,7 @@ func (c *CircuitBreaker) waitHalfOpen() {
 	c.onHalfOpenTimeout.Store(true)
 	<-time.After(c.cfg.halfOpenTimeout)
 	c.setState(HalfOpen)
+	c.addFrame()
 	c.onHalfOpenTimeout.Store(false)
 }
 
@@ -229,10 +223,6 @@ func (c *CircuitBreaker) canExecute() error {
 
 	if c.state.s == Open {
 		return ErrOpenCircuit
-	}
-
-	if c.state.s == HalfOpen {
-		return ErrHalfOpenCircuit
 	}
 
 	return nil
@@ -262,7 +252,7 @@ func (c *CircuitBreaker) unshiftFrame() Counts {
 
 	removedFrame := c.rollingWindow.window[0]
 
-	renewedWindow := make([]Counts, (len(c.rollingWindow.window) - 1))
+	renewedWindow := make([]Counts, (len(c.rollingWindow.window) - 1), cap(c.rollingWindow.window))
 	copy(renewedWindow, c.rollingWindow.window[1:])
 	c.rollingWindow.window = renewedWindow
 
@@ -278,7 +268,7 @@ func (c *CircuitBreaker) popFrame() Counts {
 
 	removedFrame := c.rollingWindow.window[i]
 
-	renewedWindow := make([]Counts, i)
+	renewedWindow := make([]Counts, i, cap(c.rollingWindow.window))
 	copy(renewedWindow, c.rollingWindow.window[:i])
 	c.rollingWindow.window = renewedWindow
 
