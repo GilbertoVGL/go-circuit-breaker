@@ -9,7 +9,7 @@ func defaultFromHalfOpenToState(summary Counts) State {
 		return Open
 	}
 
-	if summary.Total > 100 && (summary.Fail/summary.Total*100) < 99 {
+	if summary.Total > 50 {
 		return Closed
 	}
 

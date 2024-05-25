@@ -53,19 +53,19 @@ type Counts struct {
 type rollingWindow struct {
 	window []Counts
 
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 type summary struct {
 	counts Counts
 
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 type state struct {
 	s State
 
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 type configuration struct {
@@ -91,7 +91,7 @@ func New(opts ...option) (cb *CircuitBreaker, cancel func(), err error) {
 	}
 
 	if cbOpts.windowFrame > cbOpts.windowRoll {
-		return cb, cancel, fmt.Errorf("%w: frame threshold can't be minor than window roll", ErrNewCircuitBreaker)
+		return cb, cancel, fmt.Errorf("%w: invalid window threshold", ErrNewCircuitBreaker)
 	}
 
 	frames := cbOpts.windowRoll / cbOpts.windowFrame
@@ -108,7 +108,7 @@ func New(opts ...option) (cb *CircuitBreaker, cancel func(), err error) {
 			s: Closed,
 		},
 		rollingWindow: &rollingWindow{
-			window: make([]Counts, 1, frames),
+			window: make([]Counts, frames, (frames + 2)),
 		},
 		summary: &summary{
 			counts: Counts{},
@@ -118,7 +118,6 @@ func New(opts ...option) (cb *CircuitBreaker, cancel func(), err error) {
 	cancelCh := make(chan struct{})
 	cancel = cancelFunc(cancelCh)
 	go cb.renewFrame(cancelCh)
-	go cb.renewWindow(cancelCh)
 
 	return cb, cancel, nil
 }
@@ -127,24 +126,10 @@ func (c *CircuitBreaker) renewFrame(cancel <-chan struct{}) {
 	for {
 		select {
 		case <-time.After(c.cfg.windowFrame):
-			if c.state.s == HalfOpen {
+			if c.stateCopy() != Closed {
 				return
 			}
-			c.addFrame()
-		case <-cancel:
-			return
-		}
-	}
-}
-
-func (c *CircuitBreaker) renewWindow(cancel <-chan struct{}) {
-	for {
-		select {
-		case <-time.After(c.cfg.windowRoll):
-			if c.state.s == HalfOpen {
-				return
-			}
-			c.unshiftWindow()
+			c.moveWindow()
 		case <-cancel:
 			return
 		}
@@ -175,51 +160,49 @@ func (c *CircuitBreaker) Execute(fn circuitCall) error {
 }
 
 func (c *CircuitBreaker) afterExecute() {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+
 	switch c.state.s {
 	case Closed:
-		if c.canTrip(c.summary.counts) {
+		if c.canTrip(c.summaryCopy()) {
 			c.state.s = Open
 			go c.waitHalfOpen()
 		}
 
 	case HalfOpen:
-		lastFrame := c.rollingWindow.window[(len(c.rollingWindow.window) - 1)]
-
-		switch c.fromHalfOpenToState(lastFrame) {
+		switch c.fromHalfOpenToState(c.currentFrameCopy()) {
 		case Open:
 			if c.onHalfOpenTimeout.Load() {
 				return
 			}
 			go c.waitHalfOpen()
 
-			c.setState(Open)
+			c.state.s = Open
 			c.popWindow()
 
 		case Closed:
-			c.setState(Closed)
-			c.popWindow()
+			c.state.s = Closed
+			c.aggregateHalfOpenFrame()
 		}
 	}
 }
 
 func (c *CircuitBreaker) waitHalfOpen() {
 	c.onHalfOpenTimeout.Store(true)
-	<-time.After(c.cfg.halfOpenTimeout)
-	c.setState(HalfOpen)
-	c.addFrame()
-	c.onHalfOpenTimeout.Store(false)
-}
+	defer c.onHalfOpenTimeout.Store(false)
 
-func (c *CircuitBreaker) setState(s State) {
+	<-time.After(c.cfg.halfOpenTimeout)
+
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
-
-	c.state.s = s
+	c.state.s = HalfOpen
+	c.addFrame()
 }
 
 func (c *CircuitBreaker) canExecute() error {
-	c.state.mu.Lock()
-	defer c.state.mu.Unlock()
+	c.state.mu.RLock()
+	defer c.state.mu.RUnlock()
 
 	if c.state.s == Open {
 		return ErrOpenCircuit
@@ -228,21 +211,20 @@ func (c *CircuitBreaker) canExecute() error {
 	return nil
 }
 
-func (c *CircuitBreaker) addFrame() {
+func (c *CircuitBreaker) moveWindow() {
+	removedFrame := c.unshiftFrame()
+	c.decrSummary(removedFrame)
+	c.addFrame()
+}
+
+func (c *CircuitBreaker) aggregateHalfOpenFrame() {
+	halfOpenFrame := c.popFrame()
 	c.rollingWindow.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
-
-	c.rollingWindow.window = append(c.rollingWindow.window, Counts{})
-}
-
-func (c *CircuitBreaker) unshiftWindow() {
-	removedFrame := c.unshiftFrame()
-	c.decrSummary(removedFrame.Fail, removedFrame.Success)
-}
-
-func (c *CircuitBreaker) popWindow() {
-	removedFrame := c.popFrame()
-	c.decrSummary(removedFrame.Fail, removedFrame.Success)
+	i := (len(c.rollingWindow.window) - 1)
+	c.rollingWindow.window[i].Total += halfOpenFrame.Total
+	c.rollingWindow.window[i].Success += halfOpenFrame.Success
+	c.rollingWindow.window[i].Fail += halfOpenFrame.Fail
 }
 
 // unshiftFrame Removes the first frame from the rolling window.
@@ -257,6 +239,18 @@ func (c *CircuitBreaker) unshiftFrame() Counts {
 	c.rollingWindow.window = renewedWindow
 
 	return removedFrame
+}
+
+func (c *CircuitBreaker) addFrame() {
+	c.rollingWindow.mu.Lock()
+	defer c.rollingWindow.mu.Unlock()
+
+	c.rollingWindow.window = append(c.rollingWindow.window, Counts{})
+}
+
+func (c *CircuitBreaker) popWindow() {
+	removedFrame := c.popFrame()
+	c.decrSummary(removedFrame)
 }
 
 // popFrame Removes the last frame from the rolling window.
@@ -277,40 +271,61 @@ func (c *CircuitBreaker) popFrame() Counts {
 
 func (c *CircuitBreaker) incrSuccess() {
 	c.rollingWindow.mu.Lock()
+	c.summary.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
-
-	c.incrSummary(0, 1)
+	defer c.summary.mu.Unlock()
 
 	i := (len(c.rollingWindow.window) - 1)
 	c.rollingWindow.window[i].Total += 1
 	c.rollingWindow.window[i].Success += 1
+	c.summary.counts.Total += 1
+	c.summary.counts.Success += 1
 }
 
 func (c *CircuitBreaker) incrFail() {
 	c.rollingWindow.mu.Lock()
+	c.summary.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
-
-	c.incrSummary(1, 0)
+	defer c.summary.mu.Unlock()
 
 	i := (len(c.rollingWindow.window) - 1)
 	c.rollingWindow.window[i].Total += 1
 	c.rollingWindow.window[i].Fail += 1
+	c.summary.counts.Fail += 1
+	c.summary.counts.Total += 1
 }
 
-func (c *CircuitBreaker) incrSummary(fail, success uint64) {
+func (c *CircuitBreaker) decrSummary(decr Counts) {
 	c.summary.mu.Lock()
 	defer c.summary.mu.Unlock()
 
-	c.summary.counts.Fail += fail
-	c.summary.counts.Success += success
-	c.summary.counts.Total += (fail + success)
+	c.summary.counts.Fail -= decr.Fail
+	c.summary.counts.Success -= decr.Success
+	c.summary.counts.Total -= decr.Total
 }
 
-func (c *CircuitBreaker) decrSummary(fail, success uint64) {
-	c.summary.mu.Lock()
-	defer c.summary.mu.Unlock()
+func (c *CircuitBreaker) stateCopy() State {
+	c.state.mu.RLock()
+	defer c.state.mu.RUnlock()
+	return c.state.s
+}
 
-	c.summary.counts.Fail -= fail
-	c.summary.counts.Success -= success
-	c.summary.counts.Total -= (fail + success)
+func (c *CircuitBreaker) summaryCopy() Counts {
+	c.summary.mu.RLock()
+	defer c.summary.mu.RUnlock()
+	return c.summary.counts
+}
+
+func (c *CircuitBreaker) currentFrameCopy() Counts {
+	c.rollingWindow.mu.RLock()
+	defer c.rollingWindow.mu.RUnlock()
+	return c.rollingWindow.window[(len(c.rollingWindow.window) - 1)]
+}
+
+func (c *CircuitBreaker) windowCopy() []Counts {
+	c.rollingWindow.mu.RLock()
+	defer c.rollingWindow.mu.RUnlock()
+	cw := make([]Counts, len(c.rollingWindow.window), cap(c.rollingWindow.window))
+	copy(cw, c.rollingWindow.window)
+	return cw
 }

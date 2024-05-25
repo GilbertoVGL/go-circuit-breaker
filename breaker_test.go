@@ -13,17 +13,9 @@ import (
 
 var errCall = errors.New("execute error")
 
-func fixtureCircuitCall(err error) func() error {
-	return func() error {
-		return err
-	}
-}
-
 func TestBreakerCreationSuccess(t *testing.T) {
 	type expected struct {
 		onHalfOpenTimeout bool
-		windowLen         int
-		windowCap         int
 		summ              Counts
 		windowRoll        time.Duration
 		windowFrame       time.Duration
@@ -41,13 +33,11 @@ func TestBreakerCreationSuccess(t *testing.T) {
 			input: nil,
 			expected: expected{
 				onHalfOpenTimeout: false,
-				windowLen:         1,
-				windowCap:         20,
 				summ:              Counts{},
 				windowRoll:        time.Second * _windowRoll,
 				windowFrame:       time.Second * _windowFrame,
 				halfOpenTimeout:   time.Second * _halfOpenTimeout,
-				window:            []Counts{{}},
+				window:            make([]Counts, 20, 22),
 			},
 		},
 		{
@@ -59,13 +49,11 @@ func TestBreakerCreationSuccess(t *testing.T) {
 			},
 			expected: expected{
 				onHalfOpenTimeout: false,
-				windowLen:         1,
-				windowCap:         100,
 				summ:              Counts{},
 				windowRoll:        time.Second * 100000,
 				windowFrame:       time.Second * 1000,
 				halfOpenTimeout:   time.Second * 10,
-				window:            []Counts{{}},
+				window:            make([]Counts, 100, 102),
 			},
 		},
 		{
@@ -77,13 +65,11 @@ func TestBreakerCreationSuccess(t *testing.T) {
 			},
 			expected: expected{
 				onHalfOpenTimeout: false,
-				windowLen:         1,
-				windowCap:         21,
 				summ:              Counts{},
 				windowRoll:        time.Second * 4759,
 				windowFrame:       time.Second * 222,
 				halfOpenTimeout:   time.Second * 21,
-				window:            []Counts{{}},
+				window:            make([]Counts, 21, 23),
 			},
 		},
 		{
@@ -93,13 +79,11 @@ func TestBreakerCreationSuccess(t *testing.T) {
 			},
 			expected: expected{
 				onHalfOpenTimeout: false,
-				windowLen:         1,
-				windowCap:         20,
 				summ:              Counts{},
 				windowRoll:        time.Second * _windowRoll,
 				windowFrame:       time.Second * _windowFrame,
 				halfOpenTimeout:   time.Second * _halfOpenTimeout,
-				window:            []Counts{{}},
+				window:            make([]Counts, 20, 22),
 			},
 		},
 		{
@@ -109,13 +93,11 @@ func TestBreakerCreationSuccess(t *testing.T) {
 			},
 			expected: expected{
 				onHalfOpenTimeout: false,
-				windowLen:         1,
-				windowCap:         20,
 				summ:              Counts{},
 				windowRoll:        time.Second * _windowRoll,
 				windowFrame:       time.Second * _windowFrame,
 				halfOpenTimeout:   time.Second * _halfOpenTimeout,
-				window:            []Counts{{}},
+				window:            make([]Counts, 20, 22),
 			},
 		},
 	}
@@ -123,19 +105,19 @@ func TestBreakerCreationSuccess(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cb, cancel, err := New(tc.input...)
 			require.NoError(t, err)
-
 			cancel()
 
+			gotWindow := cb.windowCopy()
 			assert.Equal(t, tc.expected.onHalfOpenTimeout, cb.onHalfOpenTimeout.Load())
-			assert.Equal(t, tc.expected.windowLen, len(cb.rollingWindow.window))
-			assert.Equal(t, tc.expected.windowCap, cap(cb.rollingWindow.window))
-			assert.Equal(t, tc.expected.summ, cb.summary.counts)
+			assert.Equal(t, tc.expected.summ, cb.summaryCopy())
 			assert.Equal(t, tc.expected.windowRoll, cb.cfg.windowRoll)
 			assert.Equal(t, tc.expected.windowFrame, cb.cfg.windowFrame)
 			assert.Equal(t, tc.expected.halfOpenTimeout, cb.cfg.halfOpenTimeout)
+			assert.ElementsMatch(t, tc.expected.window, gotWindow)
+			assert.Equal(t, len(tc.expected.window), len(gotWindow))
+			assert.Equal(t, cap(tc.expected.window), cap(gotWindow))
 			assert.NotNil(t, cb.canTrip)
 			assert.NotNil(t, cb.fromHalfOpenToState)
-			assert.ElementsMatch(t, tc.expected.window, cb.rollingWindow.window)
 		})
 	}
 }
@@ -224,6 +206,14 @@ func TestBreakerCreationFails(t *testing.T) {
 }
 
 func TestBreakerOpen(t *testing.T) {
+	expectedCounts := Counts{
+		Total:   11,
+		Fail:    7,
+		Success: 4,
+	}
+	expectedWindow := make([]Counts, 100, 102)
+	expectedWindow[99] = expectedCounts
+
 	cb, cancel, err := New(
 		WithWindowFrameThreshold(1000),
 		WithWindowRollThreshold(100000),
@@ -234,24 +224,18 @@ func TestBreakerOpen(t *testing.T) {
 
 	calls := []error{
 		errCall, errCall, errCall, errCall, errCall, errCall, errCall,
-		nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil, nil,
 	}
 
-	expectedCounts := Counts{
-		Total:   11,
-		Fail:    7,
-		Success: 4,
-	}
-	expectedWindow := make([]Counts, 1, (100000 / 1000))
-	expectedWindow[0] = expectedCounts
+	syncFeedCircuitBreakerHelper(cb, calls, false)
 
-	feedCircuitBreakerHelper(cb, calls, false)
-
-	assert.Equal(t, cb.state.s, Open)
-	assert.Equal(t, expectedCounts, cb.summary.counts)
-	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
-	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
-	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+	gotWindow := cb.windowCopy()
+	assert.Equal(t, Open, cb.stateCopy())
+	assert.Equal(t, expectedCounts, cb.summaryCopy())
+	assert.Equal(t, expectedWindow[99], cb.currentFrameCopy())
+	assert.ElementsMatch(t, expectedWindow, gotWindow)
+	assert.Equal(t, len(expectedWindow), len(gotWindow))
+	assert.Equal(t, cap(expectedWindow), cap(gotWindow))
 }
 
 func TestBreakerClosedToHalfOpen(t *testing.T) {
@@ -265,8 +249,8 @@ func TestBreakerClosedToHalfOpen(t *testing.T) {
 		Fail:    7,
 		Success: 4,
 	}
-	expectedWindow := make([]Counts, 2, 3)
-	expectedWindow[0] = expectedCounts
+	expectedWindow := make([]Counts, 4, 5)
+	expectedWindow[3] = expectedCounts
 
 	cb, cancel, err := New(
 		WithWindowFrameThreshold(10),
@@ -276,15 +260,16 @@ func TestBreakerClosedToHalfOpen(t *testing.T) {
 	require.NoError(t, err)
 	defer cancel()
 
-	feedCircuitBreakerHelper(cb, calls, false)
+	syncFeedCircuitBreakerHelper(cb, calls, false)
 
-	time.Sleep(cb.cfg.halfOpenTimeout)
+	time.Sleep(cb.cfg.halfOpenTimeout + (time.Millisecond * 500))
 
-	assert.Equal(t, HalfOpen, cb.state.s)
-	assert.Equal(t, expectedCounts, cb.summary.counts)
-	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
-	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
-	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+	gotWindow := cb.windowCopy()
+	assert.Equal(t, HalfOpen, cb.stateCopy())
+	assert.Equal(t, expectedCounts, cb.summaryCopy())
+	assert.ElementsMatch(t, expectedWindow, gotWindow)
+	assert.Equal(t, len(expectedWindow), len(gotWindow))
+	assert.Equal(t, cap(expectedWindow), cap(gotWindow))
 
 	err = cb.Execute(fixtureCircuitCall(nil))
 	assert.NoError(t, err)
@@ -301,8 +286,8 @@ func TestBreakerHalfOpenToOpen(t *testing.T) {
 		Fail:    7,
 		Success: 4,
 	}
-	expectedWindow := make([]Counts, 1, 3)
-	expectedWindow[0] = expectedCounts
+	expectedWindow := make([]Counts, 3, 5)
+	expectedWindow[2] = expectedCounts
 
 	cb, cancel, err := New(
 		WithWindowFrameThreshold(10),
@@ -312,13 +297,17 @@ func TestBreakerHalfOpenToOpen(t *testing.T) {
 	require.NoError(t, err)
 	defer cancel()
 
-	feedCircuitBreakerHelper(cb, calls, false)
+	syncFeedCircuitBreakerHelper(cb, calls, false)
 
-	time.Sleep(cb.cfg.halfOpenTimeout)
+	assert.Equal(t, Open, cb.stateCopy())
+
+	time.Sleep(cb.cfg.halfOpenTimeout + (time.Millisecond * 500))
+
+	assert.Equal(t, HalfOpen, cb.stateCopy())
 
 	err = cb.Execute(fixtureCircuitCall(errCall))
 
-	assert.Equal(t, Open, cb.state.s)
+	assert.Equal(t, Open, cb.stateCopy())
 	assert.Equal(t, expectedCounts, cb.summary.counts)
 	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
 	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
@@ -331,15 +320,15 @@ func TestBreakerHalfOpenToClosed(t *testing.T) {
 		errCall, errCall, errCall, errCall, errCall, errCall, errCall,
 		nil, nil, nil, nil,
 	}
-	halfOpenCalls := make([]error, 101)
+	halfOpenCalls := make([]error, 52)
 
 	expectedCounts := Counts{
-		Total:   11,
+		Total:   63,
 		Fail:    7,
-		Success: 4,
+		Success: 56,
 	}
-	expectedWindow := make([]Counts, 1, 3)
-	expectedWindow[0] = expectedCounts
+	expectedWindow := make([]Counts, 3, 5)
+	expectedWindow[2] = expectedCounts
 
 	cb, cancel, err := New(
 		WithWindowFrameThreshold(10),
@@ -349,18 +338,48 @@ func TestBreakerHalfOpenToClosed(t *testing.T) {
 	require.NoError(t, err)
 	defer cancel()
 
-	feedCircuitBreakerHelper(cb, closedCalls, false)
+	// call to open it
+	syncFeedCircuitBreakerHelper(cb, closedCalls, false)
 
-	time.Sleep(cb.cfg.halfOpenTimeout)
+	assert.Equal(t, Open, cb.stateCopy())
 
+	// wait for half open
+	time.Sleep(cb.cfg.halfOpenTimeout + (time.Millisecond * 500))
+
+	assert.Equal(t, HalfOpen, cb.stateCopy())
+
+	// call to close it
 	feedCircuitBreakerHelper(cb, halfOpenCalls, false)
 
-	assert.Equal(t, Closed, cb.state.s)
-	assert.Equal(t, expectedCounts, cb.summary.counts)
-	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
-	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
-	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+	// wait for close
+	time.Sleep(cb.cfg.halfOpenTimeout + (time.Millisecond * 500))
+
+	t.Logf("totals:\t%+v\n", cb.summaryCopy())
+
+	gotWindow := cb.windowCopy()
+	assert.Equal(t, Closed, cb.stateCopy())
+	assert.Equal(t, expectedCounts, cb.summaryCopy())
+	assert.ElementsMatch(t, expectedWindow, gotWindow)
+	assert.Equal(t, len(expectedWindow), len(gotWindow))
+	assert.Equal(t, cap(expectedWindow), cap(gotWindow))
 	assert.ErrorIs(t, err, nil)
+}
+
+func TestBreakerWindowRollSize(t *testing.T) {
+	expectedWindow := make([]Counts, 10, 12)
+	cb, cancel, err := New(
+		WithWindowFrameThreshold(1),
+		WithWindowRollThreshold(10),
+		WithHalfOpenThreshold(2),
+	)
+	defer cancel()
+	require.NoError(t, err)
+
+	time.Sleep(time.Second * 20)
+
+	gotWindow := cb.windowCopy()
+	assert.Equal(t, len(expectedWindow), len(gotWindow))
+	assert.Equal(t, cap(expectedWindow), cap(gotWindow))
 }
 
 func TestBreakerWindowRoll(t *testing.T) {
@@ -374,18 +393,16 @@ func TestBreakerWindowRoll(t *testing.T) {
 		Success: 13,
 	}
 	expectedCounts := Counts{
-		Total:   (frame.Total * 2),
-		Fail:    (frame.Fail * 2),
-		Success: (frame.Success * 2),
+		Total:   frame.Total,
+		Fail:    frame.Fail,
+		Success: frame.Success,
 	}
-	expectedWindow := make([]Counts, 3)
+	expectedWindow := make([]Counts, 3, 5)
 	expectedWindow[0] = frame
-	expectedWindow[1] = frame
-	expectedWindow[2] = Counts{}
 
 	cb, cancel, err := New(
-		WithWindowFrameThreshold(10),
-		WithWindowRollThreshold(30),
+		WithWindowFrameThreshold(1),
+		WithWindowRollThreshold(3),
 		WithHalfOpenThreshold(2),
 	)
 	require.NoError(t, err)
@@ -393,14 +410,21 @@ func TestBreakerWindowRoll(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		feedCircuitBreakerHelper(cb, closedCalls, false)
-		time.Sleep(cb.cfg.windowFrame)
+		time.Sleep(cb.cfg.windowFrame + (time.Millisecond * 500))
 	}
 
-	assert.Equal(t, Closed, cb.state.s)
-	assert.Equal(t, expectedCounts, cb.summary.counts)
-	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
-	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
-	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+	gotWindow := cb.windowCopy()
+	assert.Equal(t, Closed, cb.stateCopy())
+	assert.Equal(t, expectedCounts, cb.summaryCopy())
+	assert.ElementsMatch(t, expectedWindow, gotWindow)
+	assert.Equal(t, len(expectedWindow), len(gotWindow))
+	assert.Equal(t, cap(expectedWindow), cap(gotWindow))
+}
+
+func fixtureCircuitCall(err error) func() error {
+	return func() error {
+		return err
+	}
 }
 
 func feedCircuitBreakerHelper(cb *CircuitBreaker, calls []error, withJitter bool) {
@@ -416,4 +440,13 @@ func feedCircuitBreakerHelper(cb *CircuitBreaker, calls []error, withJitter bool
 		}(err)
 	}
 	wg.Wait()
+}
+
+func syncFeedCircuitBreakerHelper(cb *CircuitBreaker, calls []error, withJitter bool) {
+	for _, err := range calls {
+		if withJitter {
+			time.Sleep(time.Duration(rand.Int63n(int64(2))))
+		}
+		_ = cb.Execute(fixtureCircuitCall(err))
+	}
 }
