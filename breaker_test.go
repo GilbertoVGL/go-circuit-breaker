@@ -307,11 +307,12 @@ func TestBreakerHalfOpenToOpen(t *testing.T) {
 
 	err = cb.Execute(fixtureCircuitCall(errCall))
 
+	gotWindow := cb.windowCopy()
 	assert.Equal(t, Open, cb.stateCopy())
 	assert.Equal(t, expectedCounts, cb.summary.counts)
-	assert.ElementsMatch(t, expectedWindow, cb.rollingWindow.window)
-	assert.Equal(t, len(expectedWindow), len(cb.rollingWindow.window))
-	assert.Equal(t, cap(expectedWindow), cap(cb.rollingWindow.window))
+	assert.ElementsMatch(t, expectedWindow, gotWindow)
+	assert.Equal(t, len(expectedWindow), len(gotWindow))
+	assert.Equal(t, cap(expectedWindow), cap(gotWindow))
 	assert.ErrorIs(t, err, errCall)
 }
 

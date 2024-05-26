@@ -212,8 +212,7 @@ func (c *CircuitBreaker) canExecute() error {
 }
 
 func (c *CircuitBreaker) moveWindow() {
-	removedFrame := c.unshiftFrame()
-	c.decrSummary(removedFrame)
+	c.decrSummary(c.unshiftFrame())
 	c.addFrame()
 }
 
@@ -221,52 +220,41 @@ func (c *CircuitBreaker) aggregateHalfOpenFrame() {
 	halfOpenFrame := c.popFrame()
 	c.rollingWindow.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
-	i := (len(c.rollingWindow.window) - 1)
-	c.rollingWindow.window[i].Total += halfOpenFrame.Total
-	c.rollingWindow.window[i].Success += halfOpenFrame.Success
-	c.rollingWindow.window[i].Fail += halfOpenFrame.Fail
+	c.rollingWindow.window[(len(c.rollingWindow.window) - 1)].Total += halfOpenFrame.Total
+	c.rollingWindow.window[(len(c.rollingWindow.window) - 1)].Success += halfOpenFrame.Success
+	c.rollingWindow.window[(len(c.rollingWindow.window) - 1)].Fail += halfOpenFrame.Fail
 }
 
 // unshiftFrame Removes the first frame from the rolling window.
 func (c *CircuitBreaker) unshiftFrame() Counts {
 	c.rollingWindow.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
+	defer func() {
+		c.rollingWindow.window = append(make([]Counts, 0, cap(c.rollingWindow.window)), c.rollingWindow.window[1:]...)
+	}()
 
-	removedFrame := c.rollingWindow.window[0]
-
-	renewedWindow := make([]Counts, (len(c.rollingWindow.window) - 1), cap(c.rollingWindow.window))
-	copy(renewedWindow, c.rollingWindow.window[1:])
-	c.rollingWindow.window = renewedWindow
-
-	return removedFrame
+	return c.rollingWindow.window[0]
 }
 
 func (c *CircuitBreaker) addFrame() {
 	c.rollingWindow.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
-
 	c.rollingWindow.window = append(c.rollingWindow.window, Counts{})
 }
 
 func (c *CircuitBreaker) popWindow() {
-	removedFrame := c.popFrame()
-	c.decrSummary(removedFrame)
+	c.decrSummary(c.popFrame())
 }
 
 // popFrame Removes the last frame from the rolling window.
 func (c *CircuitBreaker) popFrame() Counts {
 	c.rollingWindow.mu.Lock()
 	defer c.rollingWindow.mu.Unlock()
+	defer func() {
+		c.rollingWindow.window = c.rollingWindow.window[:(len(c.rollingWindow.window) - 1)]
+	}()
 
-	i := (len(c.rollingWindow.window) - 1)
-
-	removedFrame := c.rollingWindow.window[i]
-
-	renewedWindow := make([]Counts, i, cap(c.rollingWindow.window))
-	copy(renewedWindow, c.rollingWindow.window[:i])
-	c.rollingWindow.window = renewedWindow
-
-	return removedFrame
+	return c.rollingWindow.window[(len(c.rollingWindow.window) - 1)]
 }
 
 func (c *CircuitBreaker) incrSuccess() {
@@ -275,9 +263,8 @@ func (c *CircuitBreaker) incrSuccess() {
 	defer c.rollingWindow.mu.Unlock()
 	defer c.summary.mu.Unlock()
 
-	i := (len(c.rollingWindow.window) - 1)
-	c.rollingWindow.window[i].Total += 1
-	c.rollingWindow.window[i].Success += 1
+	c.rollingWindow.window[(len(c.rollingWindow.window) - 1)].Total += 1
+	c.rollingWindow.window[(len(c.rollingWindow.window) - 1)].Success += 1
 	c.summary.counts.Total += 1
 	c.summary.counts.Success += 1
 }
@@ -288,9 +275,8 @@ func (c *CircuitBreaker) incrFail() {
 	defer c.rollingWindow.mu.Unlock()
 	defer c.summary.mu.Unlock()
 
-	i := (len(c.rollingWindow.window) - 1)
-	c.rollingWindow.window[i].Total += 1
-	c.rollingWindow.window[i].Fail += 1
+	c.rollingWindow.window[(len(c.rollingWindow.window) - 1)].Total += 1
+	c.rollingWindow.window[(len(c.rollingWindow.window) - 1)].Fail += 1
 	c.summary.counts.Fail += 1
 	c.summary.counts.Total += 1
 }
