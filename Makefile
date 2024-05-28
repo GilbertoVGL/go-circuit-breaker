@@ -4,3 +4,6 @@ test:
 test-cover:
 	@go test -race -timeout 90s ./... -covermode=atomic -coverprofile=./.cov-report/coverage.out -coverpkg=./... -count=1
 	@go tool cover -html=./.cov-report/coverage.out
+
+benchmark:
+	@go test -bench=. -benchmem -count 5 -run=^$
